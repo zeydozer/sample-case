@@ -1,6 +1,7 @@
 import json, os, random, string, time
 from datetime import datetime, timezone
 from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable
 
 BOOTSTRAP = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC = os.getenv("TOPIC", "raw-comments")
@@ -18,19 +19,35 @@ lorem_words = (
 ).split()
 
 def rand_text():
-  n = random.randint(5, 80)  # farklı uzunluklar
+  n = random.randint(5, 80) # kelime sayısı
   return " ".join(random.choices(lorem_words, k=n)).strip()
 
 def new_id(k=12):
   alphabet = string.ascii_lowercase + string.digits
   return "".join(random.choices(alphabet, k=k))
 
-producer = KafkaProducer(
-  bootstrap_servers=BOOTSTRAP,
-  value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
-  key_serializer=lambda v: v.encode("utf-8"),
-  linger_ms=10,
-)
+def build_producer(max_wait=60):
+  start = time.time()
+  attempt, delay = 1, 1
+  while True:
+    try:
+      return KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+        key_serializer=lambda v: v.encode("utf-8"),
+        linger_ms=10,
+        retries=3,
+        request_timeout_ms=10000,
+        api_version_auto_timeout_ms=10000,
+      )
+    except NoBrokersAvailable:
+      if time.time() - start > max_wait:
+        raise
+      time.sleep(delay)
+      delay = min(delay * 2, 5) # max 5s
+      attempt += 1
+
+producer = build_producer()
 
 last_texts = []
 

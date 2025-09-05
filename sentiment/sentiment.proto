@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package sentiment;
+
+service SentimentService {
+  rpc Analyze (AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message AnalyzeRequest {
+  string text = 1;
+  string trace_id = 2;
+}
+
+message AnalyzeResponse {
+  string text = 1;
+  string label = 2;       // "positive" | "negative" | "neutral"
+  double confidence = 3;  // 0.0 - 1.0
+}

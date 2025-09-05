@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   kafka:
     image: bitnami/kafka:3.7
@@ -13,13 +12,33 @@ services:
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
       - KAFKA_CFG_NUM_PARTITIONS=3
       - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
     ports:
       - "9092:9092"
-
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  kafka-init:
+    image: bitnami/kafka:3.7
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+      /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic raw-comments --partitions 3 --replication-factor 1 &&
+      /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic processed-comments --partitions 3 --replication-factor 1
+      "
   producer:
     build: ./producer
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       - BOOTSTRAP_SERVERS=kafka:9092
       - TOPIC=raw-comments
@@ -28,3 +47,75 @@ services:
       - DUP_REPEAT_PROB=0.25
     restart: unless-stopped
     container_name: producer
+    healthcheck:
+      test: ["CMD", "python", "-c", "from kafka import KafkaProducer; KafkaProducer(bootstrap_servers='kafka:9092', request_timeout_ms=5000)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+  sentiment:
+    build: ./sentiment
+    container_name: sentiment
+    environment:
+      - PORT=50051
+      - RATE_LIMIT_RPS=100
+      - RANDOM_DROP_PROB=0.05
+      - PER_CHAR_DELAY_MS=2
+      - MAX_DELAY_MS=5000
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc,sys,sentiment_pb2,sentiment_pb2_grpc; ch=grpc.insecure_channel('localhost:50051'); stub=sentiment_pb2_grpc.SentimentServiceStub(ch); stub.Analyze(sentiment_pb2.AnalyzeRequest(text='hc', trace_id='x'))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7
+    container_name: redis
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  consumer:
+    build: ./consumer
+    container_name: consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      sentiment:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - INPUT_TOPIC=raw-comments
+      - OUTPUT_TOPIC=processed-comments
+      - GROUP_ID=comment-consumer
+      - SENTIMENT_ADDR=sentiment:50051
+      - MONGO_URI=mongodb://mongo:27017
+      - MONGO_DB=commentsdb
+      - MONGO_COL=processed
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CACHE_TTL_SEC=3600
+      - GRPC_MAX_RETRIES=3
+      - GRPC_BASE_BACKOFF_MS=100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; import pymongo; import grpc; r=redis.Redis(host='redis',port=6379); r.ping(); pymongo.MongoClient('mongodb://mongo:27017').admin.command('ping'); grpc.insecure_channel('sentiment:50051')"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
