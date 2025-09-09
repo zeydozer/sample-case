@@ -1,7 +1,7 @@
 import json, os, random, string, time
 from datetime import datetime, timezone
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
+from kafka.errors import NoBrokersAvailable, KafkaTimeoutError
 
 BOOTSTRAP = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC = os.getenv("TOPIC", "raw-comments")
@@ -26,9 +26,11 @@ def new_id(k=12):
   alphabet = string.ascii_lowercase + string.digits
   return "".join(random.choices(alphabet, k=k))
 
-def build_producer(max_wait=60):
-  start = time.time()
-  attempt, delay = 1, 1
+def build_producer():
+  # Sonsuz reconnect + üstel backoff (jitter ile)
+  base_delay = float(os.getenv("KAFKA_RETRY_BASE_DELAY_SEC", "0.5"))
+  max_delay = float(os.getenv("KAFKA_RETRY_MAX_DELAY_SEC", "10"))
+  attempt = 0
   while True:
     try:
       return KafkaProducer(
@@ -36,22 +38,24 @@ def build_producer(max_wait=60):
         value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
         key_serializer=lambda v: v.encode("utf-8"),
         linger_ms=10,
-        retries=3,
+        retries=5,
+        acks="all",
         request_timeout_ms=10000,
         api_version_auto_timeout_ms=10000,
       )
-    except NoBrokersAvailable:
-      if time.time() - start > max_wait:
-        raise
-      time.sleep(delay)
-      delay = min(delay * 2, 5) # max 5s
+    except NoBrokersAvailable as e:
       attempt += 1
+      delay = min(max_delay, base_delay * (2 ** min(attempt, 6)))
+      # jitter
+      delay = delay * (0.5 + random.random() * 0.5)
+      print(f"Kafka broker yok (producer). {attempt}. deneme, {delay:.2f}s sonra...", flush=True)
+      time.sleep(delay)
 
 producer = build_producer()
 
 last_texts = []
 
-while True:
+while True:  
   use_dup = last_texts and random.random() < DUP_P
   if use_dup:
     text = random.choice(last_texts)
@@ -70,9 +74,17 @@ while True:
   # key: aynı metin tekrar gelse de farklı commentId olabilir
   key = str(abs(hash(text)) % (10**12))
 
-  producer.send(TOPIC, key=key, value=payload)
-  producer.flush()
-
-  # değişken üretim sıklığı: kimi zaman 100ms, kimi zaman 10s
-  interval_ms = random.randint(MIN_MS, MAX_MS)
-  time.sleep(interval_ms / 1000.0)
+  try:
+    producer.send(TOPIC, key=key, value=payload)
+    producer.flush()
+    # değişken üretim sıklığı: kimi zaman 100ms, kimi zaman 10s
+    interval_ms = random.randint(MIN_MS, MAX_MS)
+    time.sleep(interval_ms / 1000.0)
+  except (NoBrokersAvailable, KafkaTimeoutError, OSError) as e:
+    print(f"Kafka gönderim hatası: {e}. Producer yeniden bağlanacak.", flush=True)
+    time.sleep(1.0)
+    producer = build_producer()
+  except Exception as e:
+    print(f"Error producing message: {e}", flush=True)
+    time.sleep(1.0)
+    producer = build_producer()
